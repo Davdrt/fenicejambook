@@ -315,7 +315,8 @@ elif st.session_state.user:
             st.divider()
             st.subheader("🏆 Vincente Torneo (Antepost)")
             antepost_disp = conn.execute("SELECT mc, quota FROM torneo_antepost WHERE eliminato=0").fetchall()
-            if non antepost_disp:
+            if not antepost_disp:
+
                 st.info("Quote antepost non disponibili o torneo non iniziato.")
             else:
                 cols = st.columns(3)

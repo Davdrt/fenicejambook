@@ -252,22 +252,40 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
                         conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (mc, quota_ant))
                     conn.commit()
                     st.success("Torneo Inizializzato! Quote Antepost live."); st.rerun()
-            else:
-                st.info("Aggiungi i team scrivendo i nomi separati da & (es. 'Paco & Inoki'). Assicurati che i nomi corrispondano esattamente all'anagrafica.")
-                team_input = st.text_area("Inserisci un Team per riga (MC1 & MC2)")
+                        else:
+                st.info("Seleziona il numero di team e scegli gli MC dai menu a tendina.")
+                num_teams = st.number_input("Numero di Team Partecipanti", min_value=1, max_value=16, value=4)
+                
+                teams_selezionati = []
+                for i in range(num_teams):
+                    st.markdown(f"**Team {i+1}**")
+                    col_t1, col_t2 = st.columns(2)
+                    mc1 = col_t1.selectbox(f"MC 1", mcs_all_ant, key=f"ant_t{i}_m1")
+                    # Imposta l'indice a 1 per evitare che selezioni lo stesso MC di default
+                    mc2 = col_t2.selectbox(f"MC 2", mcs_all_ant, key=f"ant_t{i}_m2", index=1 if len(mcs_all_ant) > 1 else 0)
+                    teams_selezionati.append((mc1, mc2))
+                    
                 if st.button("INIZIALIZZA NUOVO TORNEO (2v2)"):
-                    conn.execute("DELETE FROM torneo_antepost")
-                    teams = [t.strip() for t in team_input.split("\n") if "&" in t]
-                    for t in teams:
-                        mc1, mc2 = [x.strip() for x in t.split("&")]
-                        try:
-                            quota_base = calcola_quota_coppia(mc1, mc2)
-                            quota_ant = round((quota_base * 1.5) * (len(teams) / 3), 2)
-                            conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (t, quota_ant))
-                        except Exception as e:
-                            st.error(f"Errore calcolo quota per {t}: MC non trovati?")
-                    conn.commit()
-                    st.success("Torneo a Coppie Inizializzato!"); st.rerun()
+                    # Controllo per evitare team con due MC uguali
+                    errori = [f"Team {i+1}" for i, (m1, m2) in enumerate(teams_selezionati) if m1 == m2]
+                    if errori:
+                        st.error(f"Attenzione! I seguenti team hanno lo stesso MC selezionato due volte: {', '.join(errori)}")
+                    else:
+                        conn.execute("DELETE FROM torneo_antepost")
+                        for mc1, mc2 in teams_selezionati:
+                            nome_team = f"{mc1} & {mc2}"
+                            try:
+                                quota_base = calcola_quota_coppia(mc1, mc2)
+                                moltiplicatore = max(1, len(teams_selezionati) / 3)
+                                quota_ant = round((quota_base * 1.5) * moltiplicatore, 2)
+                                quota_ant = max(quota_base + 0.20, quota_ant) # Mai sotto la quota base
+                                
+                                conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (nome_team, quota_ant))
+                            except Exception as e:
+                                st.error(f"Errore calcolo quota per {nome_team}: MC non trovati?")
+                        conn.commit()
+                        st.success("Torneo a Coppie Inizializzato!"); st.rerun()
+
 
         with c_ant2:
             st.markdown("**Stato Attuale Torneo**")

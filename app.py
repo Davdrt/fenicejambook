@@ -252,7 +252,7 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
                         conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (mc, quota_ant))
                     conn.commit()
                     st.success("Torneo Inizializzato! Quote Antepost live."); st.rerun()
-                        else:
+            else:
                 st.info("Seleziona il numero di team e scegli gli MC dai menu a tendina.")
                 num_teams = st.number_input("Numero di Team Partecipanti", min_value=1, max_value=16, value=4)
                 

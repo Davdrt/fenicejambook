@@ -1,92 +1,167 @@
 import streamlit as st
 import pandas as pd
+import os
+import math
+from datetime import datetime
 
-# --- 1. BLOCCO PASSWORD SEGRETA ---
-def check_password():
-    # Sostituisci "segreto123" con la password che preferisci
-    if st.session_state.password == "segreto123":
-        st.session_state.password_correct = True
-    else:
-        st.error("🔒 Password errata. Accesso negato.")
+# --- CONFIGURAZIONE ---
+NOME_FILE_DB = "database_fenicebet.csv"
+NOME_FILE_TICKET = "registro_ticket_fenicebet.csv"
+PASS_SEGRETA = "segreto123"
 
-if "password_correct" not in st.session_state:
-    st.session_state.password_correct = False
+# --- FUNZIONI DI SISTEMA ---
+def carica_db():
+    if os.path.exists(NOME_FILE_DB): return pd.read_csv(NOME_FILE_DB)
+    return pd.DataFrame(columns=['Nome', 'Vittorie', 'Finali', 'Semi', 'Quarti', 'Presenze', 'Pericolo', 'Popolarita', 'Media_Forma'])
 
-if not st.session_state.password_correct:
-    st.title("🛡️ Login Bookmaker")
-    st.text_input("Inserisci la password per accedere:", type="password", key="password", on_change=check_password)
-    st.stop() # Ferma il codice qui se la password è sbagliata
+def carica_ticket():
+    if os.path.exists(NOME_FILE_TICKET): return pd.read_csv(NOME_FILE_TICKET)
+    return pd.DataFrame(columns=['ID', 'Data', 'Scommettitore', 'Scelta', 'Quota', 'Puntata', 'Vincita_Pot', 'Stato'])
 
-# --- 2. IL MOTORE DELL'APP (Visibile solo a te) ---
-st.title("🏆 Freestyle Bookmaker Pro")
+def salva_file(df, nome_file):
+    if not st.session_state.get('sandbox', False):
+        df.to_csv(nome_file, index=False)
 
-# Inizializziamo il database virtuale
-if 'partecipanti' not in st.session_state:
-    st.session_state.partecipanti = {}
-if 'tickets' not in st.session_state:
-    st.session_state.tickets = []
+# --- LOGIN FENICEBET ---
+if "autenticato" not in st.session_state: st.session_state.autenticato = False
 
-margine = 0.20
-fondo_iniziale = 150.0
-
-# --- SEZIONE: AGGIUNGI FREESTYLER ---
-with st.expander("➕ Aggiungi Freestyler in Gara"):
-    col1, col2 = st.columns(2)
-    nome = col1.text_input("Nome")
-    vittorie = col2.number_input("Vittorie", min_value=0, step=1)
-    tentativi = col1.number_input("Tentativi Totali", min_value=0, step=1)
-    pericolo = col2.number_input("Fattore Pericolo (1.0 std)", value=1.0, step=0.1)
-    
-    if st.button("Inserisci nel Torneo"):
-        if nome and nome not in st.session_state.partecipanti:
-            p_base = ((vittorie / (tentativi + 5)) if tentativi > 0 else 0.02) * pericolo
-            st.session_state.partecipanti[nome] = {'p_base': p_base, 'puntato': 0.0, 'in_gara': True}
-            st.success(f"{nome} aggiunto con successo!")
+if not st.session_state.autenticato:
+    st.set_page_config(page_title="FeniceBet - Login", page_icon="🔥")
+    st.title("🔥 FeniceBet")
+    st.subheader("Accedi al Terminale Bookmaker")
+    pwd = st.text_input("Codice Autorizzazione:", type="password")
+    if st.button("Entra nel Sistema"):
+        if pwd == PASS_SEGRETA:
+            st.session_state.autenticato = True
             st.rerun()
+    st.stop()
 
-# --- SEZIONE: LAVAGNA QUOTE IN DIRETTA ---
-in_gara = {k: v for k, v in st.session_state.partecipanti.items() if v['in_gara']}
+# --- SETUP DATI ---
+df = carica_db()
+ticket_df = carica_ticket()
 
-if in_gara:
-    somma_p = sum(x['p_base'] for x in in_gara.values())
-    cassa = fondo_iniziale + sum(x['puntato'] for x in in_gara.values())
+# --- SIDEBAR FENICEBET ---
+st.sidebar.title("🦅 FeniceBet Menu")
+st.session_state.sandbox = st.sidebar.toggle("🛠️ MODALITÀ TEST", value=False)
+margine_base = st.sidebar.slider("Margine Banco (%)", 5, 40, 20) / 100
+
+menu = st.sidebar.radio("Navigazione", ["📊 Lavagna Quote", "🎟️ Emetti Ticket", "💰 Cassa & Risultati", "🏆 Hall of Fame", "⚙️ Database MC"])
+
+# --- MOTORE DI CALCOLO FeniceBet ---
+def calcola_rating_pro(nome_mc, dataframe):
+    r = dataframe[dataframe['Nome'] == nome_mc].iloc[0]
+    punti_tot = (r['Vittorie']*10) + (r['Finali']*6) + (r['Semi']*3) + (r['Quarti']*1)
+    # Protezione novellini (fede statistica)
+    rating_storico = (punti_tot + 5) / (r['Presenze'] + 10)
+    # Fattore forma
+    affidabilita = min(r['Presenze'] / 10, 1.0)
+    forma_recente = r.get('Media_Forma', rating_storico)
+    if pd.isna(forma_recente): forma_recente = rating_storico
     
-    dati_tabella = []
-    for nome, dati in in_gara.items():
-        quota_partenza = cassa * (dati['p_base'] / somma_p)
-        quota_live = (cassa * (1 - margine)) / (quota_partenza + dati['puntato'])
-        dati['quota_corrente'] = max(round(quota_live, 2), 1.05)
+    rating_base = (rating_storico * (1 - (0.5 * affidabilita))) + (forma_recente * (0.5 * affidabilita))
+    hype = 0.7 + (r['Popolarita'] * 0.1)
+    return rating_base * r['Pericolo'] * hype
+
+def genera_quota_blindata(rating_mc, tot_rating, presenze, pericolo, margine_base):
+    p = rating_mc / tot_rating
+    # o-piccolo per incertezza
+    o_piccolo = 1 / math.sqrt(presenze + 5)
+    margine_reale = margine_base + (o_piccolo * 0.15)
+    quota = (1 / p) * (1 - margine_reale)
+    # Tetto ai BIG
+    if pericolo >= 1.6: quota = min(quota, 3.50)
+    return max(round(quota, 2), 1.10)
+
+# --- 1. LAVAGNA QUOTE (PUBBLICA) ---
+if menu == "📊 Lavagna Quote":
+    st.header("📢 FeniceBet: Quote della Serata")
+    presenti = st.multiselect("Seleziona MC in gara:", df['Nome'].tolist())
+    if presenti:
+        p_df = df[df['Nome'].isin(presenti)].copy()
+        p_df['rating_calc'] = p_df.apply(lambda x: calcola_rating_pro(x['Nome'], df), axis=1)
+        tot_r = p_df['rating_calc'].sum()
+        lavagna = []
+        for _, r in p_df.iterrows():
+            q = genera_quota_blindata(r['rating_calc'], tot_r, r['Presenze'], r['Pericolo'], margine_base)
+            lavagna.append({"Freestyler": r['Nome'], "Quota": q, "Hype": "🔥" * int(r['Popolarita'])})
+        st.table(pd.DataFrame(lavagna))
+        st.info("💡 Schermata sicura da mostrare al pubblico.")
+
+# --- 2. EMISSIONE TICKET ---
+elif menu == "🎟️ Emetti Ticket":
+    st.header("🎟️ Registrazione Scommessa")
+    incasso = ticket_df[ticket_df['Stato'] == 'In Corso']['Puntata'].sum()
+    esposizione = ticket_df[ticket_df['Stato'] == 'In Corso'].groupby('Scelta')['Vincita_Pot'].sum()
+    
+    c1, c2 = st.columns(2)
+    scommettitore = c1.text_input("Nome Cliente")
+    puntata = c2.number_input("Cifra Puntata (€)", min_value=1.0, step=1.0)
+    
+    attivi = st.multiselect("Seleziona MC:", df['Nome'].tolist())
+    if attivi and scommettitore:
+        p_df = df[df['Nome'].isin(attivi)].copy()
+        p_df['rating_calc'] = p_df.apply(lambda x: calcola_rating_pro(x['Nome'], df), axis=1)
+        tot_r = p_df['rating_calc'].sum()
+        scelta = st.selectbox("Punta su:", attivi)
+        r_scelta = p_df[p_df['Nome'] == scelta].iloc[0]
+        q_scelta = genera_quota_blindata(r_scelta['rating_calc'], tot_r, r_scelta['Presenze'], r_scelta['Pericolo'], margine_base)
+        vincita_pot = round(puntata * q_scelta, 2)
         
-        dati_tabella.append({
-            "Freestyler": nome,
-            "Puntato (€)": f"€ {dati['puntato']:.2f}",
-            "QUOTA": f"{dati['quota_corrente']:.2f}"
-        })
+        # ALERT RISCHIO
+        esposizione_futura = esposizione.get(scelta, 0) + vincita_pot
+        st.metric("Vincita Potenziale", f"{vincita_pot} €", f"Quota: {q_scelta}")
+        
+        accetta = True
+        if incasso > 0:
+            if esposizione_futura > incasso:
+                st.error("🛑 BLOCCO: Rischio troppo alto per il banco su questo MC.")
+                accetta = False
+            elif esposizione_futura > (incasso * 0.7):
+                st.warning("⚠️ Rischio Elevato.")
+
+        if st.button("Stampa Ticket", disabled=not accetta):
+            nuovo_t = pd.DataFrame([[len(ticket_df)+1, datetime.now().strftime("%H:%M"), scommettitore, scelta, q_scelta, puntata, vincita_pot, "In Corso"]], columns=ticket_df.columns)
+            ticket_df = pd.concat([ticket_df, nuovo_t], ignore_index=True)
+            salva_file(ticket_df, NOME_FILE_TICKET)
+            st.success("Ticket FeniceBet Eseguito!")
+            st.code(f"--- FENICEBET TICKET ---\nID: {len(ticket_df)}\nCliente: {scommettitore}\nSu: {scelta}\nQuota: {q_scelta}\nVincita: {vincita_pot}€\n------------------------")
+
+# --- 3. CASSA & RISULTATI ---
+elif menu == "💰 Cassa & Risultati":
+    st.header("💰 Bilancio Live FeniceBet")
+    incasso_t = ticket_df['Puntata'].sum()
+    rischio_t = ticket_df[ticket_df['Stato'] == 'In Corso']['Vincita_Pot'].sum()
+    st.columns(2)[0].metric("Incasso Reale", f"{incasso_t} €")
+    st.columns(2)[1].metric("Debito Potenziale", f"{rischio_t} €", delta_color="inverse")
+    st.bar_chart(pd.DataFrame({'Euro': [incasso_t, rischio_t]}, index=['Entrate', 'Rischio']))
     
-    st.subheader("📊 Lavagna Quote")
-    # Mostriamo una bella tabella ordinata
-    st.dataframe(pd.DataFrame(dati_tabella), use_container_width=True)
+    st.subheader("🏁 Chiusura Serata")
+    vincitore = st.selectbox("Vincitore Ufficiale:", ["-"] + df['Nome'].tolist())
+    if st.button("Paga Ticket & Aggiorna Ranking"):
+        ticket_df.loc[(ticket_df['Scelta'] == vincitore) & (ticket_df['Stato'] == 'In Corso'), 'Stato'] = 'VINTO ✅'
+        ticket_df.loc[(ticket_df['Scelta'] != vincitore) & (ticket_df['Stato'] == 'In Corso'), 'Stato'] = 'PERSO ❌'
+        salva_file(ticket_df, NOME_FILE_TICKET)
+        # Aggiorna Rating & Pericolo Autom.
+        p_att = df.loc[df['Nome'] == vincitore, 'Pericolo'].values[0]
+        df.loc[df['Nome'] == vincitore, ['Vittorie', 'Presenze', 'Pericolo']] = [df.loc[df['Nome'] == vincitore, 'Vittorie'].values[0]+1, df.loc[df['Nome'] == vincitore, 'Presenze'].values[0]+1, round(min(p_att + 0.1, 2.0), 2)]
+        salva_file(df, NOME_FILE_DB)
+        st.success("FeniceBet ha aggiornato la Hall of Fame e pagato i vincitori!")
 
-    # --- SEZIONE: REGISTRA PUNTATA ---
-    st.subheader("💶 Nuova Scommessa")
-    col3, col4 = st.columns(2)
-    chi = col3.selectbox("Su chi puntano?", list(in_gara.keys()))
-    soldi = col4.number_input("Importo (€)", min_value=1.0, step=1.0)
-    
-    if st.button("PUNTA E BLOCCA QUOTA", type="primary"):
-        q_fissa = in_gara[chi]['quota_corrente']
-        st.session_state.tickets.append({'nome': chi, 'importo': soldi, 'vincita': soldi * q_fissa})
-        st.session_state.partecipanti[chi]['puntato'] += soldi
-        st.success(f"✅ Registrati €{soldi} su {chi} a quota {q_fissa}")
-        st.rerun()
-
-    # --- SEZIONE: ELIMINAZIONE ---
-    st.subheader("💀 Elimina Partecipante")
-    chi_esce = st.selectbox("Chi ha perso la battle?", list(in_gara.keys()))
-    if st.button("Elimina dal Torneo"):
-        st.session_state.partecipanti[chi_esce]['in_gara'] = False
-        st.warning(f"{chi_esce} è stato eliminato.")
-        st.rerun()
-
-else:
-    st.info("Nessun freestyler in gara. Aggiungine uno dal menu in alto.")
+# --- 5. DATABASE MC ---
+elif menu == "⚙️ Database MC":
+    st.header("⚙️ Gestione Anagrafica")
+    st.dataframe(df.sort_values(by="Vittorie", ascending=False))
+    with st.form("edit"):
+        n = st.text_input("Nome d'arte")
+        v = st.number_input("Vittorie Storiche", 0)
+        p = st.number_input("Presenze Storiche", 0)
+        per = st.slider("Livello Pericolo", 0.5, 2.0, 1.0)
+        pop = st.slider("Hype (Popolarità)", 1, 5, 3)
+        if st.form_submit_button("Salva"):
+            if n in df['Nome'].values:
+                df.loc[df['Nome'] == n, ['Vittorie', 'Presenze', 'Pericolo', 'Popolarita']] = [v, p, per, pop]
+            else:
+                nuovo = pd.DataFrame([[n, v, 0, 0, 0, p, per, pop, 0.5]], columns=df.columns)
+                df = pd.concat([df, nuovo], ignore_index=True)
+            salva_file(df, NOME_FILE_DB)
+            st.rerun()

@@ -9,7 +9,7 @@ import math
 import plotly.express as px
 
 # --- CONFIGURAZIONE UI PREMIUM ---
-st.set_page_config(page_title="FeniceBet", page_icon="🔥", layout="wide")
+st.set_page_config(page_title="FeniceBet v13", page_icon="🔥", layout="wide")
 
 st.markdown("""
     <style>
@@ -85,10 +85,8 @@ def init_db():
     c.execute('CREATE TABLE IF NOT EXISTS ticket (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, dettagli TEXT, quota REAL, puntata REAL, vincita_pot REAL, stato TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS tokens (codice TEXT PRIMARY KEY, usato INT DEFAULT 0)')
     c.execute('CREATE TABLE IF NOT EXISTS flussi (id INTEGER PRIMARY KEY AUTOINCREMENT, ts DATETIME DEFAULT CURRENT_TIMESTAMP, tipo TEXT, importo REAL, user TEXT)')
-    # Tabella Torneo Antepost
     c.execute('CREATE TABLE IF NOT EXISTS torneo_antepost (mc TEXT PRIMARY KEY, quota REAL, eliminato INT DEFAULT 0, turno INT DEFAULT 1)')
     
-    # Account Admin pre-configurato
     c.execute('INSERT OR IGNORE INTO utenti (username, email, password, saldo) VALUES ("ADMIN", "admin@fenice.bet", "admin123", 10000)')
     conn.commit()
     return conn
@@ -107,6 +105,18 @@ def calcola_quote_tecnica(mc_nome):
     rating = ((v * 15) + 10) / (p + 12)
     prob = rating * per * (0.85 + pop * 0.05)
     return round(max(1.15, min(1 / (prob / (prob + 1)) + 0.12, 8.5)), 2)
+
+def calcola_quota_coppia(mc1, mc2):
+    q1 = calcola_quote_tecnica(mc1)
+    q2 = calcola_quote_tecnica(mc2)
+    # Rimuoviamo temporaneamente il margine del banco per avere la probabilità pura
+    prob_pura_1 = (1 / q1) * 1.12 
+    prob_pura_2 = (1 / q2) * 1.12
+    # La forza della coppia è la media della loro probabilità pura di vittoria
+    forza_coppia = (prob_pura_1 + prob_pura_2) / 2
+    # Riconvertiamo in quota riapplicando l'aggio del banco (12%)
+    quota_coppia = round((1 / forza_coppia) + 0.12, 2)
+    return max(1.10, min(quota_coppia, 15.00))
 
 # --- SESSION STATE ---
 for key in ['user', 'is_admin', 'view_as_player', 'schedina', 'spin_active']:
@@ -140,6 +150,10 @@ with st.sidebar:
                 else: st.error("Dati errati.")
     else:
         st.write(f"👤 Warrior: **{st.session_state.user}**")
+        bonus_user = conn.execute("SELECT bonus_attivo FROM utenti WHERE username=?", (st.session_state.user,)).fetchone()
+        if bonus_user and bonus_user[0] != "NESSUNO":
+            st.warning(f"🎁 Bonus Attivo: {bonus_user[0]}")
+            
         if st.session_state.is_admin:
             st.session_state.view_as_player = st.toggle("Vista Giocatore", st.session_state.view_as_player)
             if st.button("🚀 BOOST ADMIN (+10k)"):
@@ -152,7 +166,7 @@ with st.sidebar:
 # --- AREA ADMIN ---
 if st.session_state.is_admin and not st.session_state.view_as_player:
     st.title("🕹️ Dashboard Suprema")
-    adm_tabs = st.tabs(["📉 Finanza", "🧪 Simulatore & Match", "🏆 Torneo Antepost", "🎤 MC Management", "🎫 Token"])
+    adm_tabs = st.tabs(["📉 Finanza", "🧪 Match Maker", "🏆 Torneo Antepost", "🎤 MC Management", "🎫 Token"])
     
     with adm_tabs[0]:
         df_f = pd.read_sql_query("SELECT ts, importo FROM flussi", conn)
@@ -162,57 +176,56 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
             st.metric("Saldo Totale Sistema", f"{conn.execute('SELECT SUM(saldo) FROM utenti').fetchone()[0]:,.0f} 🪙")
 
     with adm_tabs[1]:
-        st.subheader("🧪 Simulatore Torneo (No DB)")
         mcs_all = [m[0] for m in conn.execute("SELECT nome FROM mcs").fetchall()]
-        if not mcs_all: st.warning("Aggiungi MC prima!")
+        if not mcs_all: 
+            st.warning("Aggiungi MC prima!")
         else:
-            sim_mcs = st.multiselect("Seleziona MC per Simulazione", mcs_all, default=mcs_all[:min(8, len(mcs_all))])
-            if st.button("AVVIA SIMULAZIONE TORNEO"):
-                if len(sim_mcs) < 2:
-                    st.error("Seleziona almeno 2 MC!")
-                else:
-                    attivi = sim_mcs.copy()
-                    turno_n = 1
-                    while len(attivi) > 1:
-                        st.markdown(f"#### 🔴 Turno {turno_n}")
-                        next_round = []
-                        random.shuffle(attivi) # Mix casuale per gli accoppiamenti
-                        for i in range(0, len(attivi), 2):
-                            if i + 1 < len(attivi):
-                                m1, m2 = attivi[i], attivi[i+1]
-                                q1, q2 = calcola_quote_tecnica(m1), calcola_quote_tecnica(m2)
-                                p1 = (1/q1) / ((1/q1) + (1/q2))
-                                vincitore = m1 if random.random() < p1 else m2
-                                st.write(f"⚔️ {m1} (@{q1}) vs {m2} (@{q2}) ➔ **Vince: {vincitore}**")
-                                next_round.append(vincitore)
-                            else:
-                                st.write(f"🟢 {attivi[i]} passa il turno in automatico (Dispari)")
-                                next_round.append(attivi[i])
-                        attivi = next_round
-                        turno_n += 1
-                    st.success(f"🏆 VINCITORE SIMULATO DEL TORNEO: **{attivi[0]}**")
-        
-        st.divider()
-        st.subheader("⚔️ Pubblica Match Reale Singolo")
-        ca, cb = st.columns(2)
-        m_real1 = ca.selectbox("MC 1 Reale", mcs_all, key="mr1")
-        q_real1 = ca.number_input("Quota 1", calcola_quote_tecnica(m_real1))
-        m_real2 = cb.selectbox("MC 2 Reale", mcs_all, key="mr2")
-        q_real2 = cb.number_input("Quota 2", calcola_quote_tecnica(m_real2))
-        if st.button("VAI LIVE!"):
-            conn.execute("INSERT INTO matches (desc, mc1, mc2, q1, q2, stato) VALUES (?,?,?,?,?,?)", (f"{m_real1} vs {m_real2}", m_real1, m_real2, q_real1, q_real2, "APERTO"))
-            conn.commit(); st.success("Match pubblicato nell'arena!")
+            tipo_match = st.radio("Tipo di Match", ["1 vs 1", "2 vs 2"])
+            
+            st.subheader(f"⚔️ Pubblica Match {tipo_match}")
+            if tipo_match == "1 vs 1":
+                ca, cb = st.columns(2)
+                m_real1 = ca.selectbox("MC 1 Reale", mcs_all, key="mr1")
+                q_real1 = ca.number_input("Quota 1", calcola_quote_tecnica(m_real1))
+                m_real2 = cb.selectbox("MC 2 Reale", mcs_all, key="mr2")
+                q_real2 = cb.number_input("Quota 2", calcola_quote_tecnica(m_real2))
+                if st.button("VAI LIVE (1v1)!"):
+                    conn.execute("INSERT INTO matches (desc, mc1, mc2, q1, q2, stato) VALUES (?,?,?,?,?,?)", (f"{m_real1} vs {m_real2}", m_real1, m_real2, q_real1, q_real2, "APERTO"))
+                    conn.commit(); st.success("Match 1v1 pubblicato!")
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Team 1**")
+                    t1_m1 = st.selectbox("MC 1 - Team 1", mcs_all, key="t1m1")
+                    t1_m2 = st.selectbox("MC 2 - Team 1", mcs_all, key="t1m2")
+                    q_team1 = st.number_input("Quota Team 1", calcola_quota_coppia(t1_m1, t1_m2))
+                with c2:
+                    st.markdown("**Team 2**")
+                    t2_m1 = st.selectbox("MC 1 - Team 2", mcs_all, key="t2m1")
+                    t2_m2 = st.selectbox("MC 2 - Team 2", mcs_all, key="t2m2")
+                    q_team2 = st.number_input("Quota Team 2", calcola_quota_coppia(t2_m1, t2_m2))
+                
+                if st.button("VAI LIVE (2v2)!"):
+                    nome_t1 = f"{t1_m1} & {t1_m2}"
+                    nome_t2 = f"{t2_m1} & {t2_m2}"
+                    conn.execute("INSERT INTO matches (desc, mc1, mc2, q1, q2, stato) VALUES (?,?,?,?,?,?)", (f"{nome_t1} vs {nome_t2}", nome_t1, nome_t2, q_team1, q_team2, "APERTO"))
+                    conn.commit(); st.success("Match 2v2 pubblicato!")
 
         st.divider()
-        st.subheader("🏁 Chiudi Scontri Singoli")
+        st.subheader("🏁 Chiudi Scontri Singoli/Coppie")
         aperti = conn.execute("SELECT id, desc, mc1, mc2 FROM matches WHERE stato='APERTO'").fetchall()
         if aperti:
             sel_id = st.selectbox("Match da chiudere", [m[0] for m in aperti], format_func=lambda x: [m[1] for m in aperti if m[0]==x][0])
             m_dat = [m for m in aperti if m[0]==sel_id][0]
             win = st.radio("Vincitore Effettivo", [m_dat[2], m_dat[3]])
-            if st.button("LIQUIDA SCOMMESSE SINGOLE"):
+            if st.button("LIQUIDA SCOMMESSE"):
                 conn.execute("UPDATE matches SET stato='CHIUSO', vincitore=? WHERE id=?", (win, sel_id))
-                conn.execute("UPDATE mcs SET punti_ranking=punti_ranking+3, vittorie=vittorie+1, presenze=presenze+1 WHERE nome=?", (win,))
+                
+                # Se è un team (contiene "&"), splitta per dare punti ranking a entrambi, altrimenti singolo
+                vincitori = [mc.strip() for mc in win.split("&")]
+                for v in vincitori:
+                    conn.execute("UPDATE mcs SET punti_ranking=punti_ranking+3, vittorie=vittorie+1, presenze=presenze+1 WHERE nome=?", (v,))
+                
                 # Payout
                 winners = conn.execute("SELECT id, username, vincita_pot FROM ticket WHERE stato='IN CORSO' AND dettagli LIKE ?", (f"%{win}%",)).fetchall()
                 for w in winners:
@@ -226,18 +239,35 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
         
         c_ant1, c_ant2 = st.columns(2)
         with c_ant1:
+            tipo_torneo = st.radio("Formato Torneo", ["Singolo (1v1)", "Coppie (2v2)"], horizontal=True)
             mcs_all_ant = [m[0] for m in conn.execute("SELECT nome FROM mcs").fetchall()]
-            partecipanti = st.multiselect("1. Seleziona MC Iniziali", mcs_all_ant)
-            if st.button("INIZIALIZZA NUOVO TORNEO"):
-                conn.execute("DELETE FROM torneo_antepost") # Reset torneo
-                for mc in partecipanti:
-                    # Calcolo stima quota antepost: Quota match * fattore torneo
-                    quota_base = calcola_quote_tecnica(mc)
-                    quota_ant = round((quota_base * 1.5) * (len(partecipanti) / 3), 2)
-                    conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (mc, quota_ant))
-                conn.commit()
-                st.success("Torneo Inizializzato! Quote Antepost live.")
-                st.rerun()
+            
+            if tipo_torneo == "Singolo (1v1)":
+                partecipanti = st.multiselect("Seleziona MC Iniziali", mcs_all_ant)
+                if st.button("INIZIALIZZA NUOVO TORNEO (1v1)"):
+                    conn.execute("DELETE FROM torneo_antepost")
+                    for mc in partecipanti:
+                        quota_base = calcola_quote_tecnica(mc)
+                        quota_ant = round((quota_base * 1.5) * (len(partecipanti) / 3), 2)
+                        conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (mc, quota_ant))
+                    conn.commit()
+                    st.success("Torneo Inizializzato! Quote Antepost live."); st.rerun()
+            else:
+                st.info("Aggiungi i team scrivendo i nomi separati da & (es. 'Paco & Inoki'). Assicurati che i nomi corrispondano esattamente all'anagrafica.")
+                team_input = st.text_area("Inserisci un Team per riga (MC1 & MC2)")
+                if st.button("INIZIALIZZA NUOVO TORNEO (2v2)"):
+                    conn.execute("DELETE FROM torneo_antepost")
+                    teams = [t.strip() for t in team_input.split("\n") if "&" in t]
+                    for t in teams:
+                        mc1, mc2 = [x.strip() for x in t.split("&")]
+                        try:
+                            quota_base = calcola_quota_coppia(mc1, mc2)
+                            quota_ant = round((quota_base * 1.5) * (len(teams) / 3), 2)
+                            conn.execute("INSERT INTO torneo_antepost (mc, quota) VALUES (?,?)", (t, quota_ant))
+                        except Exception as e:
+                            st.error(f"Errore calcolo quota per {t}: MC non trovati?")
+                    conn.commit()
+                    st.success("Torneo a Coppie Inizializzato!"); st.rerun()
 
         with c_ant2:
             st.markdown("**Stato Attuale Torneo**")
@@ -247,7 +277,6 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
                     col1, col2, col3 = st.columns([2,1,1])
                     col1.write(f"🎤 {a_mc} (T{a_t}) - @{a_q}")
                     if col2.button("Avanza ⬆️", key=f"up_{a_mc}"):
-                        # Dimezza circa la quota per il passaggio del turno
                         nuova_q = round(max(1.10, a_q / 1.8), 2)
                         conn.execute("UPDATE torneo_antepost SET turno=turno+1, quota=? WHERE mc=?", (nuova_q, a_mc))
                         conn.commit(); st.rerun()
@@ -262,14 +291,13 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
         vincitore_assoluto = st.selectbox("Seleziona Vincitore Assoluto", [m[0] for m in antepost_live] if antepost_live else ["-"])
         if st.button("PROCLAMA VINCITORE E LIQUIDA ANTEPOST") and vincitore_assoluto != "-":
             conn.execute("UPDATE torneo_antepost SET eliminato=1 WHERE mc!=?", (vincitore_assoluto,))
-            # Payout Antepost
             winners_ant = conn.execute("SELECT id, username, vincita_pot FROM ticket WHERE stato='IN CORSO' AND dettagli LIKE ?", (f"%Vincente Torneo->{vincitore_assoluto}%",)).fetchall()
             for w in winners_ant:
                 conn.execute("UPDATE utenti SET saldo = saldo + ? WHERE username=?", (w[2], w[1]))
                 conn.execute("UPDATE ticket SET stato='VINTO' WHERE id=?", (w[0],))
                 registra_movimento("PAYOUT_ANTEPOST", w[2], w[1])
-            conn.execute("DELETE FROM torneo_antepost") # Pulisci a fine torneo
-            conn.commit(); st.success(f"Torneo concluso! {vincitore_assoluto} vince e scommesse liquidate."); st.rerun()
+            conn.execute("DELETE FROM torneo_antepost")
+            conn.commit(); st.success(f"Torneo concluso! Scommesse liquidate."); st.rerun()
 
     with adm_tabs[3]:
         st.subheader("Anagrafica MC")
@@ -289,8 +317,9 @@ if st.session_state.is_admin and not st.session_state.view_as_player:
 
 # --- AREA GIOCATORE ---
 elif st.session_state.user:
-    u_data = conn.execute("SELECT saldo FROM utenti WHERE username=?", (st.session_state.user,)).fetchone()
+    u_data = conn.execute("SELECT saldo, bonus_attivo FROM utenti WHERE username=?", (st.session_state.user,)).fetchone()
     saldo = u_data[0]
+    bonus_attivo = u_data[1]
     
     st.title("🏟️ FeniceBet Arena")
     st.metric("TUO SALDO 🪙", f"{saldo:,.0f}")
@@ -302,7 +331,7 @@ elif st.session_state.user:
         with cl:
             st.subheader("🔥 Match Live")
             live = conn.execute("SELECT * FROM matches WHERE stato='APERTO'").fetchall()
-            if not live: st.info("Nessun match singolo aperto.")
+            if not live: st.info("Nessun match aperto.")
             for l in live:
                 with st.container():
                     st.markdown(f"**{l[1]}**")
@@ -315,8 +344,7 @@ elif st.session_state.user:
             st.divider()
             st.subheader("🏆 Vincente Torneo (Antepost)")
             antepost_disp = conn.execute("SELECT mc, quota FROM torneo_antepost WHERE eliminato=0").fetchall()
-            if not antepost_disp:
-
+            if not antepost_disp: # <-- ERRORE FIXATO QUI
                 st.info("Quote antepost non disponibili o torneo non iniziato.")
             else:
                 cols = st.columns(3)
@@ -334,6 +362,11 @@ elif st.session_state.user:
                     st.write(f"✅ {s['desc']}: **{s['scelta']}** (@{s['quota']})")
                     qt *= s['quota']
                 st.write(f"📈 QUOTA TOT: **{qt:.2f}**")
+                
+                # Info bonus per iteration future della schedina
+                if bonus_attivo != "NESSUNO":
+                    st.info(f"Bonus disponibile: {bonus_attivo}. Verrà applicato nelle prossime release del sistema.")
+
                 pnt = st.number_input("Puntata", 10, int(max(10, saldo)))
                 v_pot = pnt * qt
                 if v_pot > 500000: v_pot = 500000; st.warning("Tetto 500k!")
@@ -359,25 +392,49 @@ elif st.session_state.user:
                 res = conn.execute("SELECT usato FROM tokens WHERE codice=?", (t_in,)).fetchone()
                 if res and res[0] == 0:
                     conn.execute("UPDATE tokens SET usato=1 WHERE codice=?", (t_in,))
+                    
                     rot = random.randint(3000, 6000)
                     st.markdown(f"<div class='wheel-base' style='--rotation: {rot}deg;'></div>", unsafe_allow_html=True)
                     with st.spinner("Decelerazione in corso..."): time.sleep(5)
-                    vinto = random.choice([500, 1000, 2000, 5000, 10000])
-                    conn.execute("UPDATE utenti SET saldo = saldo + ? WHERE username=?", (vinto, st.session_state.user))
+                    
+                    # LOGICA RUOTA CON PESI
+                    premi_ruota = [
+                        "💰 +500 Punti", "🔥 +1000 Punti", "🛡️ SCUDO FENICE", "📈 BOOST QUOTA X2", 
+                        "🎟️ FREE BET 1000", "🏆 +2000 Punti", "🚑 ASSICURAZIONE K.O.", 
+                        "🚀 BOOST QUOTA X3", "💎 RADDOPPIO SALDO", "🎰 MEGA JACKPOT (+5000)"
+                    ]
+                    pesi_probabilita = [30, 25, 15, 10, 7, 5, 4, 2, 1.5, 0.5]
+                    vincita_testo = random.choices(premi_ruota, weights=pesi_probabilita, k=1)[0]
+                    
+                    vinto = 0
+                    if "500 Punti" in vincita_testo: vinto = 500
+                    elif "1000 Punti" in vincita_testo and "FREE" not in vincita_testo: vinto = 1000
+                    elif "2000 Punti" in vincita_testo: vinto = 2000
+                    elif "MEGA JACKPOT" in vincita_testo: vinto = 5000
+                    elif "RADDOPPIO" in vincita_testo: vinto = saldo
+                    else:
+                        conn.execute("UPDATE utenti SET bonus_attivo=? WHERE username=?", (vincita_testo, st.session_state.user))
+                    
+                    if vinto > 0:
+                        conn.execute("UPDATE utenti SET saldo = saldo + ? WHERE username=?", (vinto, st.session_state.user))
+                    
                     conn.commit(); st.balloons()
-                    st.markdown(f"<div class='win-overlay'><h1>🔥 HAI VINTO {vinto} PUNTI! 🔥</h1><p>Saldo aggiornato.</p></div>", unsafe_allow_html=True)
-                    time.sleep(3); st.rerun()
+                    st.markdown(f"<div class='win-overlay'><h1>{vincita_testo}</h1><p>Inventario Aggiornato.</p></div>", unsafe_allow_html=True)
+                    time.sleep(3.5); st.rerun()
                 else: st.error("Token non valido o già usato!")
         with col_w2:
             st.markdown("""
             ### 📜 Probabilità Premi
-            La Crazy Wheel distribuisce in modo equo uno dei seguenti jackpot ad ogni giro:
-            
-            * 🪙 **500 Punti:** 20%
-            * 🪙 **1.000 Punti:** 20%
-            * 🪙 **2.000 Punti:** 20%
-            * 🪙 **5.000 Punti:** 20%
-            * 🔥 **10.000 Punti:** 20%
+            * 💰 **+500 Punti:** 30%
+            * 🔥 **+1.000 Punti:** 25%
+            * 🛡️ **SCUDO FENICE:** 15%
+            * 📈 **BOOST QUOTA X2:** 10%
+            * 🎟️ **FREE BET 1000:** 7%
+            * 🏆 **+2.000 Punti:** 5%
+            * 🚑 **ASSICURAZIONE K.O.:** 4%
+            * 🚀 **BOOST QUOTA X3:** 2%
+            * 💎 **RADDOPPIO SALDO:** 1.5%
+            * 🎰 **MEGA JACKPOT (+5000):** 0.5%
             """)
 
     with u_tabs[2]:
